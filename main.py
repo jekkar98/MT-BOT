@@ -1,65 +1,76 @@
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+import logging
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_IDS = list(map(int, os.getenv("OWNER_IDS", "").split(',')))  # Например: "821932338,384949127"
+OWNER_IDS = list(map(int, os.getenv("OWNER_IDS", "").split(",")))  # Например: "12345,67890"
 
-# Хранение состояния пользователя: ждём заявку или отзыв
-user_states = {}  # user_id: 'waiting_for_request' | 'waiting_for_review' | None
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("Оставить заявку", callback_data='request')],
-        [InlineKeyboardButton("Оставить отзыв", callback_data='review')],
+        [InlineKeyboardButton("Оставить заявку", callback_data="leave_request")],
+        [InlineKeyboardButton("Отзывы", callback_data="reviews")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Привет! Выберите опцию:", reply_markup=reply_markup)
-    user_states[update.effective_user.id] = None
+    await update.message.reply_text("Привет! Выберите действие:", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    data = query.data
 
-    if query.data == 'request':
+    if data == "leave_request":
         await query.message.reply_text("✍️ Пожалуйста, напишите вашу заявку в ответном сообщении.")
-        user_states[user_id] = 'waiting_for_request'
-    elif query.data == 'review':
-        await query.message.reply_text("📝 Пожалуйста, напишите ваш отзыв в ответном сообщении.")
-        user_states[user_id] = 'waiting_for_review'
+        context.user_data["awaiting_request"] = True
+
+    elif data == "reviews":
+        reviews_text = (
+            "Отзывы наших клиентов:\n\n"
+            "1. Отличный сервис! Рекомендую.\n"
+            "2. Быстро и профессионально.\n"
+            "3. Очень доволен работой бота."
+        )
+        await query.message.reply_text(reviews_text)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text
-
-    state = user_states.get(user_id)
-
-    if state == 'waiting_for_request':
-        # Пересылаем заявку владельцам
+    if context.user_data.get("awaiting_request"):
+        text = update.message.text
+        # Переслать владельцам
         for owner_id in OWNER_IDS:
-            await context.bot.send_message(chat_id=owner_id, text=f"Заявка от {user_id}:\n{text}")
-        await update.message.reply_text("Спасибо! Ваша заявка отправлена.")
-        user_states[user_id] = None
+            try:
+                await context.bot.send_message(chat_id=owner_id, text=f"Новая заявка от @{update.message.from_user.username or update.message.from_user.id}:\n\n{text}")
+            except Exception as e:
+                logger.error(f"Ошибка при отправке заявки владельцу {owner_id}: {e}")
 
-    elif state == 'waiting_for_review':
-        # Пересылаем отзыв владельцам
-        for owner_id in OWNER_IDS:
-            await context.bot.send_message(chat_id=owner_id, text=f"Отзыв от {user_id}:\n{text}")
-        await update.message.reply_text("Спасибо за ваш отзыв!")
-        user_states[user_id] = None
-
+        await update.message.reply_text("Спасибо за заявку! Мы свяжемся с вами.")
+        context.user_data["awaiting_request"] = False
     else:
-        await update.message.reply_text("Пожалуйста, нажмите /start и выберите действие.")
+        await update.message.reply_text("Пожалуйста, выберите действие из меню командой /start")
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_handler(MessageHandler(filters.CallbackQueryHandler(button_handler)))
 
-    application.run_polling()
+    # Запуск приложения с webhook или polling
+    # Для локальной разработки можно заменить webhook на polling:
+    # application.run_polling()
+    # Но для Render нужно запускать с webhook. Ты сам указывал url webhook.
+
+    # В Render обычно запускаем вот так:
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", "8443")),
+        url_path=BOT_TOKEN,
+        webhook_url=f"https://<твое_доменное_имя>/{BOT_TOKEN}"
+    )
 
 if __name__ == "__main__":
     main()
