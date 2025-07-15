@@ -1,70 +1,98 @@
+import asyncio
+from flask import Flask, request, abort
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+
 import os
-import requests
-from flask import Flask, request
-import telegram
 
-TOKEN = os.getenv("BOT_TOKEN")  # Токен из настроек Render / .env
-WEBHOOK_PATH = f"/{TOKEN}"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://yourdomain.com/<токен>
+TOKEN = os.getenv("BOT_TOKEN")  # передавай токен в переменной окружения в Render
+ADMIN_CHAT_IDS = [821932338, 384949127]  # твои айди для получения заявок
 
-bot = telegram.Bot(token=TOKEN)
 app = Flask(__name__)
 
-# Установка webhook при старте
-def set_webhook():
-    url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
-    params = {"url": WEBHOOK_URL}
-    resp = requests.get(url, params=params)
-    print("Set webhook response:", resp.json())
+# Создаём Application - новый бот с поддержкой async
+application = Application.builder().token(TOKEN).build()
 
+# Главное меню
+def main_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("Оставить заявку", callback_data="request")],
+        [InlineKeyboardButton("Оставить отзыв", callback_data="review")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Добро пожаловать в MT-IT!\n\nВыберите действие:",
+        reply_markup=main_menu_keyboard()
+    )
+
+# Обработка кнопок меню
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "request":
+        await query.edit_message_text("✍️ Пожалуйста, напишите вашу заявку в ответном сообщении.")
+        context.user_data["expecting"] = "request"
+
+    elif query.data == "review":
+        await query.edit_message_text("📝 Пожалуйста, напишите ваш отзыв в ответном сообщении.")
+        context.user_data["expecting"] = "review"
+
+# Обработка сообщений (заявки и отзывы)
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    text = update.message.text
+    expecting = context.user_data.get("expecting")
+
+    if expecting == "request":
+        # Отправляем заявку администраторам
+        for admin_id in ADMIN_CHAT_IDS:
+            await application.bot.send_message(
+                chat_id=admin_id,
+                text=f"📩 *Заявка* от [{user.first_name}](tg://user?id={user.id}):\n\n{text}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        await update.message.reply_text("Спасибо! Ваша заявка отправлена.")
+        context.user_data["expecting"] = None
+
+    elif expecting == "review":
+        # Отправляем отзыв администраторам
+        for admin_id in ADMIN_CHAT_IDS:
+            await application.bot.send_message(
+                chat_id=admin_id,
+                text=f"⭐ *Отзыв* от [{user.first_name}](tg://user?id={user.id}):\n\n{text}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        await update.message.reply_text("Спасибо за ваш отзыв!")
+        context.user_data["expecting"] = None
+
+    else:
+        # Если сообщение вне диалога с меню
+        await update.message.reply_text("Пожалуйста, воспользуйтесь /start и выберите действие.")
+
+# Регистрируем хэндлеры
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CallbackQueryHandler(button_handler))
+application.add_handler(application.message_handler(message_handler))
+
+# Flask webhook route — сюда Телега шлёт обновления
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True)
+    update = Update.de_json(data, application.bot)
+    asyncio.run(application.update_queue.put(update))
+    return "OK"
+
+# Просто проверка доступности
 @app.route("/")
 def index():
-    return "MT-IT Bot is running."
+    return "MT-IT Telegram Bot is running!"
 
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
-
-    if update.message is None:
-        return "ok"
-
-    chat_id = update.message.chat.id
-    message = update.message.text or ""
-
-    # Обработка команд и сообщений
-    if message.lower() in ["/start", "старт", "привет"]:
-        keyboard = telegram.ReplyKeyboardMarkup(
-            [["📩 Оставить заявку", "📝 Оставить отзыв"]],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-        bot.send_message(chat_id=chat_id,
-                         text="👋 Добро пожаловать в MT-IT!\n\nВыберите действие ниже:",
-                         reply_markup=keyboard)
-        return "ok"
-
-    if message == "📩 Оставить заявку":
-        bot.send_message(chat_id=chat_id, text="✍️ Пожалуйста, напишите вашу заявку в ответном сообщении.")
-        return "ok"
-
-    if message == "📝 Оставить отзыв":
-        bot.send_message(chat_id=chat_id, text="✍️ Пожалуйста, напишите ваш отзыв в ответном сообщении.")
-        return "ok"
-
-    # Если сообщение не команда, считаем что это заявка или отзыв в зависимости от последнего действия
-    # Для упрощения будем просто пересылать все сообщения, которые не команда
-
-    # Пересылаем сообщение на твои ID
-    admins = [821932338, 384949127]
-    for admin_id in admins:
-        bot.send_message(chat_id=admin_id,
-                         text=f"📬 Новое сообщение от @{update.message.from_user.username} (ID: {chat_id}):\n\n{message}")
-
-    bot.send_message(chat_id=chat_id, text="✅ Спасибо! Ваше сообщение получено.")
-    return "ok"
-
-
+# Запуск Flask
 if __name__ == "__main__":
-    set_webhook()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # В Render будет использоваться gunicorn, а локально - просто python main.py
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
