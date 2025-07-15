@@ -71,5 +71,9 @@ def webhook():
 
 # Запуск приложения через webhook с портом Render
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8443))
+    port_str = os.environ.get("PORT", "")
+    if port_str.isdigit():
+        port = int(port_str)
+    else:
+        port = 8443
     app.run(host="0.0.0.0", port=port)
