@@ -1,61 +1,86 @@
 import os
 from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import asyncio
+from telegram import Bot, Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Получение переменных среды
-TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))  # Например: 821932338
-WEBHOOK_URL = f"{os.getenv('RENDER_EXTERNAL_URL')}{TOKEN}"
+# Чтение переменных окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://yourbot.onrender.com/
+OWNER_IDS = [int(x.strip()) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip().isdigit()]
 
-# Flask-приложение
+# Flask
 app = Flask(__name__)
-bot = Bot(token=TOKEN)
+bot = Bot(token=BOT_TOKEN)
+application = Application.builder().token(BOT_TOKEN).build()
 
-# Команда /start
+# Хранилище состояний пользователей
+user_states = {}
+
+# Состояния
+STATE_WAITING_FOR_APPLICATION = "waiting_for_application"
+STATE_WAITING_FOR_REVIEW = "waiting_for_review"
+
+# Старт
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привет! Нажми кнопку 'Оставить заявку'.")
+    keyboard = [["✍️ Оставить заявку", "💬 Оставить отзыв"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "Привет! Выберите действие ниже 👇",
+        reply_markup=reply_markup
+    )
+    user_states[update.effective_chat.id] = None
 
-# Обработка обычных сообщений
+# Обработка текстов
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message and update.message.reply_to_message.from_user.id == (await bot.get_me()).id:
-        text = update.message.text
-        user = update.message.from_user
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=f"📨 Новая заявка от @{user.username or user.first_name} ({user.id}):\n\n{text}"
-        )
-        await update.message.reply_text("✅ Заявка отправлена!")
-    else:
-        await update.message.reply_text("✍️ Пожалуйста, напишите вашу заявку в ответном сообщении.")
+    chat_id = update.effective_chat.id
+    text = update.message.text
 
-# Обработка вебхука
-@app.route(f"/{TOKEN}", methods=["POST"])
+    state = user_states.get(chat_id)
+
+    if text == "✍️ Оставить заявку":
+        await update.message.reply_text("✍️ Пожалуйста, напишите вашу заявку:")
+        user_states[chat_id] = STATE_WAITING_FOR_APPLICATION
+        return
+
+    if text == "💬 Оставить отзыв":
+        await update.message.reply_text("💬 Пожалуйста, напишите ваш отзыв:")
+        user_states[chat_id] = STATE_WAITING_FOR_REVIEW
+        return
+
+    # Обработка заявки
+    if state == STATE_WAITING_FOR_APPLICATION:
+        for owner_id in OWNER_IDS:
+            await bot.send_message(chat_id=owner_id, text=f"📩 Новая заявка от {chat_id}:\n\n{text}")
+        await update.message.reply_text("✅ Ваша заявка отправлена. Спасибо!")
+        user_states[chat_id] = None
+        return
+
+    # Обработка отзыва
+    if state == STATE_WAITING_FOR_REVIEW:
+        for owner_id in OWNER_IDS:
+            await bot.send_message(chat_id=owner_id, text=f"⭐ Отзыв от {chat_id}:\n\n{text}")
+        await update.message.reply_text("✅ Спасибо за ваш отзыв!")
+        user_states[chat_id] = None
+        return
+
+    # Если нет состояния
+    await update.message.reply_text("Нажмите одну из кнопок ниже, чтобы продолжить.")
+
+# Вебхук
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     asyncio.run(application.process_update(update))
     return "ok"
 
-# Главная страница для Render
-@app.route("/", methods=["GET"])
-def index():
-    return "MT-IT Bot is running."
+@app.route("/")
+def home():
+    return "Бот работает."
 
-# Основной запуск
+# Хендлеры
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
 if __name__ == "__main__":
-    application = Application.builder().token(TOKEN).build()
-
-    # Обработчики команд и сообщений
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
-    # Установка вебхука
-    async def set_webhook():
-        await application.bot.set_webhook(WEBHOOK_URL)
-
-    asyncio.get_event_loop().run_until_complete(set_webhook())
-
-    # Запуск Flask
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
