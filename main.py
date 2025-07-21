@@ -1,79 +1,136 @@
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import logging
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
-from flask import Flask, request, Response
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_IDS = [int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip().isdigit()]
-
-app = Flask(__name__)
-application = Application.builder().token(BOT_TOKEN).build()
-
-# Клавиатура с кнопкой заявки
-keyboard = InlineKeyboardMarkup.from_button(
-    InlineKeyboardButton(text="📩 Оставить заявку", callback_data="leave_request")
+# Включение логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-# Стейт для хранения заявок (простой словарь в памяти)
-user_requests = {}
+# Состояния разговора
+APPLY, FEEDBACK = range(2)
 
-# Хэндлер на команду /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Чтение конфиденциальных данных из переменных окружения
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_IDS = os.environ.get("OWNER_IDS", "")
+
+if not BOT_TOKEN:
+    logger.error("Не задан BOT_TOKEN в переменных окружения")
+    exit("Error: BOT_TOKEN not set")
+
+# Парсим строку OWNER_IDS в список целых ID владельцев
+owners = []
+if OWNER_IDS:
+    owners = [int(x) for x in OWNER_IDS.split(",") if x.strip().isdigit()]
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка команды /start: показывает приветствие с двумя кнопками."""
+    keyboard = [
+        ["📩 Оставить заявку", "⭐ Оставить отзыв"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard, one_time_keyboard=True, resize_keyboard=True
+    )
     await update.message.reply_text(
-        "Привет! Нажми кнопку ниже, чтобы оставить заявку.",
-        reply_markup=keyboard
+        "Здравствуйте! Вы можете оставить заявку или отзыв. Пожалуйста, выберите действие:",
+        reply_markup=reply_markup,
     )
 
-# Обработка нажатия кнопки
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "leave_request":
-        user_requests[query.from_user.id] = True
-        await query.message.reply_text("✍️ Пожалуйста, напишите вашу заявку в ответном сообщении.")
+async def apply_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пользователь выбрал «Оставить заявку»: просим ввести текст заявки."""
+    await update.message.reply_text("Пожалуйста, введите текст вашей заявки:")
+    return APPLY
 
-# Обработка текстовых сообщений (заявок)
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_requests.get(user_id):
-        # Пересылаем заявку всем владельцам
-        text = f"📨 Заявка от @{update.message.from_user.username or update.message.from_user.first_name}:\n\n{update.message.text}"
-        for owner_id in OWNER_IDS:
-            try:
-                await context.bot.send_message(chat_id=owner_id, text=text)
-            except Exception as e:
-                print(f"Ошибка при отправке владельцу {owner_id}: {e}")
-        await update.message.reply_text("Спасибо! Ваша заявка отправлена.")
-        user_requests.pop(user_id)
+async def feedback_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пользователь выбрал «Оставить отзыв»: просим ввести текст отзыва."""
+    await update.message.reply_text("Пожалуйста, введите текст вашего отзыва:")
+    return FEEDBACK
+
+async def receive_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получаем текст заявки и отправляем его владельцам."""
+    user = update.message.from_user
+    text = update.message.text
+    message = f"📩 *Новая заявка*\nОт: {user.full_name} (id={user.id})\n\n{text}"
+    # Отправляем сообщение каждому владельцу
+    for owner_id in owners:
+        try:
+            await context.bot.send_message(chat_id=owner_id, text=message, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Ошибка отправки заявки владельцу {owner_id}: {e}")
+    await update.message.reply_text(
+        "✅ Спасибо! Ваше сообщение отправлено.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
+
+async def receive_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получаем текст отзыва и отправляем его владельцам."""
+    user = update.message.from_user
+    text = update.message.text
+    message = f"⭐ *Новый отзыв*\nОт: {user.full_name} (id={user.id})\n\n{text}"
+    for owner_id in owners:
+        try:
+            await context.bot.send_message(chat_id=owner_id, text=message, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Ошибка отправки отзыва владельцу {owner_id}: {e}")
+    await update.message.reply_text(
+        "✅ Спасибо! Ваше сообщение отправлено.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Позволяет пользователю отменить текущий ввод."""
+    await update.message.reply_text(
+        "Действие отменено.", reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
+
+def main() -> None:
+    """Запуск бота."""
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Обработчик команды /start
+    application.add_handler(CommandHandler("start", start))
+
+    # ConversationHandler для обработки заявок и отзывов
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^📩 Оставить заявку$"), apply_request),
+            MessageHandler(filters.Regex(r"^⭐ Оставить отзыв$"), feedback_request)
+        ],
+        states={
+            APPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_application)],
+            FEEDBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_feedback)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    application.add_handler(conv_handler)
+
+    # Определяем режим работы: webhook (на Render) или polling (локально)
+    PORT = int(os.environ.get("PORT", 5000))
+    render_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if render_hostname:
+        # Запуск в режиме webhook для Render
+        webhook_url = f"https://{render_hostname}/{BOT_TOKEN}"
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url
+        )
     else:
-        await update.message.reply_text("Пожалуйста, нажмите кнопку, чтобы оставить заявку.", reply_markup=keyboard)
+        # Локальный запуск с Long Polling
+        application.run_polling()
 
-# Регистрируем хэндлеры
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(button))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
-# --- Flask endpoint для webhook ---
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    update = Update.de_json(data, application.bot)
-    application.update_queue.put(update)
-    return Response("ok", status=200)
-
-# Запуск приложения через webhook с портом Render
 if __name__ == "__main__":
-    port_str = os.environ.get("PORT", "")
-    if port_str.isdigit():
-        port = int(port_str)
-    else:
-        port = 8443
-    app.run(host="0.0.0.0", port=port)
+    main()
